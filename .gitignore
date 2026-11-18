@@ -1,6 +1,12 @@
 *.exe
 *.pdb
 *.bak
+*.asar
+*.log
+claude
+ropilot-mcp-router
+target/
 node_modules/
 dist/
 .tmp/
+.DS_Store
