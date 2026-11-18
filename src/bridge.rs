@@ -1,5 +1,4 @@
 #![allow(non_snake_case)]
-use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -130,8 +129,6 @@ struct TurnState {
     inFlight: bool,
     textBuf: String,
     emittedText: bool,
-    suppressedSteps: HashSet<u64>,
-    emittedImages: HashSet<String>,
     stderrTail: Vec<String>,
     transcriptLock: Arc<Mutex<Option<PathBuf>>>,
     stdoutLock: Arc<Mutex<()>>,
@@ -697,54 +694,6 @@ fn EmitAssistantText(text: &str, state: &mut TurnState) {
     }
 }
 
-fn StageImage(srcPath: &str) -> String {
-    let trimmed = srcPath.trim().trim_start_matches("file:///");
-    let clean = if cfg!(windows) { trimmed.replace('/', "\\") } else { trimmed.to_string() };
-    let src = Path::new(&clean);
-    if !src.is_file() { return clean; }
-    let tmp = env::temp_dir();
-    if clean.to_ascii_lowercase().starts_with(&tmp.to_string_lossy().to_ascii_lowercase()) {
-        return clean;
-    }
-    let dir = tmp.join("ropilot-agy-images");
-    if fs::create_dir_all(&dir).is_err() { return clean; }
-    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
-    let dest = dir.join(format!("studio_{}.{}", NowMs(), ext));
-    if fs::copy(src, &dest).is_ok() { dest.to_string_lossy().to_string() } else { clean }
-}
-
-fn EmitChatImage(imgPath: &str, stepNum: u64, state: &mut TurnState) {
-    let trimmed = imgPath.trim().trim_start_matches("file:///");
-    let key = if cfg!(windows) { trimmed.replace('/', "\\") } else { trimmed.to_string() };
-    if key.is_empty() || !state.emittedImages.insert(key.clone()) { return; }
-    EnsureInit(state);
-    let cmd = format!("__ROPILOT_CHAT_IMAGE__:{}", StageImage(&key));
-    let id = format!("img_{}", stepNum);
-    let useEvt = format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"Bash\",\"input\":{{\"command\":\"{}\"}}}}]}}}}\n",
-        id, EscapeJson(&cmd)
-    );
-    EmitStdout(&useEvt, &state.stdoutLock);
-    let resEvt = format!(
-        "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"ok\",\"is_error\":false}}]}}}}\n",
-        id
-    );
-    EmitStdout(&resEvt, &state.stdoutLock);
-}
-
-fn ExtractOffloadedImage(text: &str) -> Option<String> {
-    let idx = text.find("file:///")?;
-    let rest = &text[idx + 8..];
-    let end = rest.find(|c: char| c == ']' || c.is_whitespace() || c == '"').unwrap_or(rest.len());
-    let cand = &rest[..end];
-    if IsImagePath(cand) { Some(cand.to_string()) } else { None }
-}
-
-fn IsImagePath(path: &str) -> bool {
-    let low = path.trim().to_ascii_lowercase();
-    [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"].iter().any(|e| low.ends_with(e))
-}
-
 fn CleanDisplayPath(raw: &str) -> String {
     let s = raw.trim();
     if s.is_empty() { return "workspace".to_string(); }
@@ -872,20 +821,6 @@ fn HandleTool(line: &str, state: &mut TurnState) {
     let stepId = format!("toolu_{}", stepNum);
 
     if stepState == "ACTIVE" {
-        let toolRaw = ExtractStr(line, "tool_name").unwrap_or_default();
-        let base = toolRaw.rsplit(':').next().unwrap_or(&toolRaw);
-        if matches!(base, "read_file" | "view_file" | "Read") {
-            let params = ExtractObj(line, "parameters").unwrap_or_else(|| line.to_string());
-            let rawPath = ExtractStr(&params, "Path")
-                .or_else(|| ExtractStr(&params, "AbsolutePath"))
-                .or_else(|| ExtractStr(&params, "file_path"))
-                .unwrap_or_default();
-            if IsImagePath(&rawPath) {
-                state.suppressedSteps.insert(stepNum);
-                EmitChatImage(&rawPath, stepNum, state);
-                return;
-            }
-        }
         let (name, inputJson) = MapToolPayload(line);
         let evt = format!(
             "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{}\",\"name\":\"{}\",\"input\":{}}}]}}}}\n",
@@ -895,10 +830,6 @@ fn HandleTool(line: &str, state: &mut TurnState) {
     } else if stepState == "DONE" {
         let info = ExtractObj(line, "tool_info").unwrap_or_else(|| line.to_string());
         let out = ExtractStr(&info, "output").unwrap_or_default();
-        if let Some(img) = ExtractOffloadedImage(&out) {
-            EmitChatImage(&img, stepNum, state);
-        }
-        if state.suppressedSteps.remove(&stepNum) { return; }
         let evt = format!(
             "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{}\",\"content\":\"{}\",\"is_error\":false}}]}}}}\n",
             EscapeJson(&stepId), EscapeJson(&out)
@@ -1150,8 +1081,6 @@ fn RunSession(cfg: BridgeCfg, initModel: String) -> i32 {
         inFlight: false,
         textBuf: String::new(),
         emittedText: false,
-        suppressedSteps: HashSet::new(),
-        emittedImages: HashSet::new(),
         stderrTail: Vec::new(),
         transcriptLock: Arc::clone(&transcriptLock),
         stdoutLock: Arc::new(Mutex::new(())),
