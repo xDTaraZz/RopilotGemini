@@ -1,0 +1,6 @@
+*.exe
+*.pdb
+*.bak
+node_modules/
+dist/
+.tmp/
